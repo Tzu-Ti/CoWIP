@@ -1,0 +1,9 @@
+_pycache_
+
+# training data
+test.json
+train&val.json
+val.json
+
+# training logs
+lightning_logs
