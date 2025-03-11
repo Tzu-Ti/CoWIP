@@ -1,4 +1,5 @@
 _pycache_
+*/_pycache_
 
 # training data
 test.json
