@@ -1,9 +1,10 @@
-__pycache__/
+__pycache__
+*/__pycache__
 
 # training data
-/test.json
-/train&val.json
-/val.json
+*/test.json
+*/train&val.json
+*/val.json
 
 # training logs
 lightning_logs
