@@ -15,7 +15,7 @@ class CSIEncoder(nn.Module):
             vae_latent_shape : [C, H, W]
         """
         print("[MODEL] Create Full Model")
-        self.encoder = ERC_Transformer(**CONFIG['ERC_Transformer'])
+        self.ERC = ERC_Transformer(**CONFIG['ERC_Transformer'])
         self.lat_shape = CONFIG['FullModel']['vae_latent_shape'] # [C, H, W]
         latent_dim = reduce(lambda x, y: x*y, self.lat_shape)
         self.fc_mu = nn.Linear(latent_dim, latent_dim)
@@ -32,10 +32,10 @@ class CSIEncoder(nn.Module):
         return mu + eps*std
     
     def forward(self, amp, pha, srcmask=None):
-        if self.encoder.return_channel_stream:
-            amp, pha, amp_channel, pha_channel = self.encoder(amp, pha, srcmask)
+        if self.ERC.return_channel_stream:
+            amp, pha, amp_channel, pha_channel = self.ERC(amp, pha, srcmask)
         else:
-            amp, pha = self.encoder(amp, pha, srcmask)
+            amp, pha = self.ERC(amp, pha, srcmask)
         out = self.aggr(amp, pha)
         mu = self.fc_mu(out)
         log_var = self.fc_var(out)
@@ -43,7 +43,7 @@ class CSIEncoder(nn.Module):
         z = self.fc(z)
         z = z.reshape(-1, self.lat_shape[0], self.lat_shape[1], self.lat_shape[2])
         
-        if self.encoder.return_channel_stream:
+        if self.ERC.return_channel_stream:
             return z, mu, log_var, amp_channel, pha_channel
         else:
             return z, mu, log_var

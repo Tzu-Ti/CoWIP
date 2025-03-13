@@ -6,6 +6,7 @@ from torchvision.transforms.functional import InterpolationMode
 import json
 import numpy as np
 from PIL import Image
+import os
 
 def get_data_list(json_path: str, mode: str):
     """
@@ -17,6 +18,8 @@ def get_data_list(json_path: str, mode: str):
     data_list: the data list of the CSI
         ["/root/SSD/PiWiFi/NYCU/Env4/npy/F3/5_posi/240508_152018/1715152876595249214.npz",
         "/root/SSD/PiWiFi/NYCU/Env3/npy/M3/5_posi/240508_105725/1715137086843263338.npz", ...]
+        ["/root/bindingvolume/CSI_dataset_UNCC/Env2/npy/F1/1_posi/241102_134944/1730569892598354411.npz",
+        "/root/bindingvolume/CSI_dataset_UNCC/Env1/npy/F2/1_posi/241102_144833/1730573381748239710.npz", ...]
     """
     with open(json_path, 'r') as f:
         data_list = json.load(f)
@@ -25,7 +28,7 @@ def get_data_list(json_path: str, mode: str):
 
 class CSI2Mask_Dataset(Dataset):
     def __init__(self,
-                 json_path: str, mode: str = 'train',
+                 json_path: str, data_root: str, mode: str = 'train',
                  size: tuple = (192, 256),
                  amp_offset: float = 60000, pha_offset: float = 28000):
         """
@@ -42,11 +45,12 @@ class CSI2Mask_Dataset(Dataset):
 
         # Get the data list
         self.data_list = get_data_list(json_path, mode)
+        self.data_list = [os.path.join(data_root, data) for data in self.data_list]
 
         # Accroding to the Env, classify the data into different Env
         self.env_dict = {}
         for data in self.data_list:
-            env = data.split('/')[5]
+            env = data.split('/')[4]
             if env not in self.env_dict:
                 self.env_dict[env] = []
             self.env_dict[env].append(data)
@@ -105,21 +109,22 @@ class CSI2Mask_Dataset(Dataset):
 
     def __getitem__(self, index):
         csi_path = self.data_list[index]
-        env = csi_path.split('/')[5]
+        env = csi_path.split('/')[4]
         amp, pha = self._get_csi(csi_path)
         
         # choose another data in the same or different env
-        if np.random.rand() > 0.5:
+        if np.random.rand() > 0.9:
             another_env = env
             label = 1
         else:
-            keys = list(self.env_dict.keys())
-            keys.remove(env)
-            another_env = np.random.choice(keys)
-            label = -1
+            if self.mode == 'train':
+                keys = list(self.env_dict.keys())
+                keys.remove(env)
+                another_env = np.random.choice(keys)
+                label = -1
         
-        another_csi_path = np.random.choice(self.env_dict[another_env])
-        another_amp, another_pha = self._get_csi(another_csi_path)
+                another_csi_path = np.random.choice(self.env_dict[another_env])
+                another_amp, another_pha = self._get_csi(another_csi_path)
 
         # mask
         mask_path = csi_path.replace('npy', 'img').replace('.npz', '_mask.png')
@@ -134,9 +139,10 @@ class CSI2Mask_Dataset(Dataset):
         return len(self.data_list)
 
 if __name__ == '__main__':
-    json_path = '/root/CSI/WiFi2Seg_pl/datas/train&val.json'
-    dataset = CSI2Mask_Dataset(json_path, 'train')
+    json_path = '/root/workspace/CoWIP/datas/test.json'
+    dataset = CSI2Mask_Dataset(json_path, 'test')
     for i in range(len(dataset)):
-        [amp1, pha1, mask], _, _ = dataset[i]
+        amp1, pha1, mask = dataset[i]
+        # [amp1, pha1, mask], _, _ = dataset[i]
         break
         

@@ -13,8 +13,9 @@ def random_src_mask(shape: list, ratio: float = 0.):
     mask = mask < ratio
     return mask
 
-class ContrastiveLoss():
+class ContrastiveLoss(nn.Module):
     def __init__(self):
+        super().__init__()
         self.COSINE = nn.CosineEmbeddingLoss(margin=0.5)
 
     def forward(self, anchor, feature, label):
