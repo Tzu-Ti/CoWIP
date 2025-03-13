@@ -166,7 +166,7 @@ if __name__ == '__main__':
         'num_workers': 4,
         'epochs': 400,
         'model_config_path': './model_config.yaml',
-        'data_root': '/root/bindingvolume/CSI_dataset_UNCC',
+        'data_root': '/root/bindingvolume/CSI_dataset_UNCC', # /root/SSD/PiWiFi/NYCU/
         'train&val_json_path': '/root/workspace/CoWIP/datas/UNCC/train&val.json',
         'val_json_path': '/root/workspace/CoWIP/datas/UNCC/val.json',
         'test_json_path': '/root/workspace/CoWIP/datas/UNCC/test.json',
