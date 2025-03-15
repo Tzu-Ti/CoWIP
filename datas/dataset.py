@@ -50,7 +50,7 @@ class CSI2Mask_Dataset(Dataset):
         # Accroding to the Env, classify the data into different Env
         self.env_dict = {}
         for data in self.data_list:
-            env = data.split('/')[4]
+            env = data.split('/')[5]
             if env not in self.env_dict:
                 self.env_dict[env] = []
             self.env_dict[env].append(data)
@@ -109,11 +109,11 @@ class CSI2Mask_Dataset(Dataset):
 
     def __getitem__(self, index):
         csi_path = self.data_list[index]
-        env = csi_path.split('/')[4]
+        env = csi_path.split('/')[5]
         amp, pha = self._get_csi(csi_path)
         
         # choose another data in the same or different env
-        if np.random.rand() > 0.9:
+        if np.random.rand() > 0.5:
             another_env = env
             label = 1
         else:
@@ -123,8 +123,8 @@ class CSI2Mask_Dataset(Dataset):
                 another_env = np.random.choice(keys)
                 label = -1
         
-                another_csi_path = np.random.choice(self.env_dict[another_env])
-                another_amp, another_pha = self._get_csi(another_csi_path)
+        another_csi_path = np.random.choice(self.env_dict[another_env])
+        another_amp, another_pha = self._get_csi(another_csi_path)
 
         # mask
         mask_path = csi_path.replace('npy', 'img').replace('.npz', '_mask.png')

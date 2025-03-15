@@ -162,15 +162,15 @@ def main(config):
 if __name__ == '__main__':
     config = {
         'lr': 1e-5,
-        'batch_size': 48,
+        'batch_size': 32,
         'num_workers': 4,
         'epochs': 400,
         'model_config_path': './model_config.yaml',
-        'data_root': '/root/bindingvolume/CSI_dataset_UNCC', # /root/SSD/PiWiFi/NYCU/
-        'train&val_json_path': '/root/workspace/CoWIP/datas/UNCC/train&val.json',
-        'val_json_path': '/root/workspace/CoWIP/datas/UNCC/val.json',
-        'test_json_path': '/root/workspace/CoWIP/datas/UNCC/test.json',
-        'mode': 'test',
+        'data_root': '/root/SSD/PiWiFi/NYCU/', # /root/SSD/PiWiFi/NYCU/
+        'train&val_json_path': '/root/terry/CoWIP/datas/NYCU/train&val.json',
+        'val_json_path': '/root/terry/CoWIP/datas/NYCU/val.json',
+        'test_json_path': '/root/terry/CoWIP/datas/NYCU/test.json',
+        'mode': 'train',
         'ckpt_path': '/root/workspace/CoWIP/lightning_logs/WiFi2Seg/version_6/checkpoints/epoch=4-step=11705.ckpt'
     }
 
