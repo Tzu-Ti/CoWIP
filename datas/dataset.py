@@ -26,6 +26,56 @@ def get_data_list(json_path: str, mode: str):
 
     return data_list[mode]
 
+class Mask_Dataset(Dataset):
+    def __init__(self,
+                 json_path: str, data_root: str, mode: str = 'train',
+                 size: tuple = (192, 256)):
+        """
+        Mask dataset
+        :param json_path: the file contain data path
+        :param mode: dataset mode, ["train", "val", "test"]
+        :param size: the size of mask
+        """
+        self.mode = mode
+
+        # Get the data list
+        self.data_list = get_data_list(json_path, mode)
+        self.data_list = [os.path.join(data_root, data) for data in self.data_list]
+
+        # For transform mask data
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize(size, interpolation=InterpolationMode.NEAREST),
+        ])
+
+    def _get_mask(self, mask_path):
+        """
+        Get the mask data from the png file
+        :param mask_path: the path of the png file
+
+        Return:
+        mask: the mask data
+        """
+        mask = Image.open(mask_path).convert('L')
+        mask = self.transform(mask).float()
+
+        return mask
+
+    def __getitem__(self, index):
+        csi_path = self.data_list[index]
+
+        # mask
+        mask_path = csi_path.replace('npy', 'img').replace('.npz', '_mask.png')
+        mask = self._get_mask(mask_path)
+
+        if self.mode == 'train':
+            return mask
+        else:
+            return mask
+
+    def __len__(self):
+        return len(self.data_list)
+
 class CSI2Mask_Dataset(Dataset):
     def __init__(self,
                  json_path: str, data_root: str, mode: str = 'train',

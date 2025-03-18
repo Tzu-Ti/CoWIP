@@ -121,7 +121,7 @@ class VAE(nn.Module):
         z = self.fc(z)
         z = z.view(-1, 1024, self.feature_size[0], self.feature_size[1])
         x = self.decoder(z)
-        return x, mu, logvar, z
+        return x, mu, logvar
 
 class VAE_Finetune(nn.Module):
     def __init__(self, activation='leakyrelu') -> None:
