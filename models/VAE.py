@@ -6,16 +6,19 @@ from torch import nn
 class Encoder(nn.Module):
     def __init__(self, in_size: Tuple = (192, 256), activation='leakyrelu') -> None:
         super(Encoder, self).__init__()
+        input_block_channel = 16
         inchannels = [64, 128, 256, 512, 1024]
         self.activation = activation
+        print("[MODEL] Create VAE Encoder:")
         self.input_block = nn.Sequential(
-            nn.Conv2d(1, 16, 7, stride=2, padding=3),
-            nn.BatchNorm2d(16),
+            nn.Conv2d(1, input_block_channel, 7, stride=2, padding=3),
+            nn.BatchNorm2d(input_block_channel),
             Activation(self.activation),
-            nn.Conv2d(16, inchannels[0], 5, stride=2, padding=2),
+            nn.Conv2d(input_block_channel, inchannels[0], 5, stride=2, padding=2),
             nn.BatchNorm2d(inchannels[0]),
             Activation(self.activation),
         )
+        print(f"\tInput layer info-> <in_channels:{1}, out_channels:{inchannels[0]}>")
         self.layers = self._make_layers(inchannels)
         self.bottle_neck = nn.Sequential(
             ResidualBlock(inchannels[-1], inchannels[-1], self.activation),
@@ -23,6 +26,7 @@ class Encoder(nn.Module):
         )
         self.feature_size = (in_size[0] // (2**(len(inchannels) + 1)), 
                              in_size[1] // (2**(len(inchannels) + 1)))
+        print("[MODEL] VAE Encoder created.")
         
     def _make_layers(self, inchannels:List[int]):
         layers = nn.ModuleList()
@@ -33,7 +37,7 @@ class Encoder(nn.Module):
                 Activation(self.activation),
                 ResidualBlock(inchannels[i+1], inchannels[i+1], self.activation),
             ))
-            print(f"Encoder layer info-> <layer:{i}, in_channels:{inchannels[i]}, out_channels:{inchannels[i+1]}>")
+            print(f"\tEncoder layer info-> <layer:{i}, in_channels:{inchannels[i]}, out_channels:{inchannels[i+1]}>")
         return layers
     
     def forward(self, x):
@@ -98,6 +102,7 @@ class VAE(nn.Module):
         self.decoder = Decoder(activation=activation)
         self.feature_size = self.encoder.feature_size
         self.latent_dim = 1024*self.feature_size[0]*self.feature_size[1]
+        print(f"[MODEL] Latent dimension: 1024*{self.feature_size[0]}*{self.feature_size[1]} = {self.latent_dim}")
         self.fc_mu = nn.Sequential(
             nn.Linear(self.latent_dim , self.latent_dim),
         )
