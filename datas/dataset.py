@@ -167,11 +167,10 @@ class CSI2Mask_Dataset(Dataset):
             another_env = env
             label = 1
         else:
-            if self.mode == 'train':
-                keys = list(self.env_dict.keys())
-                keys.remove(env)
-                another_env = np.random.choice(keys)
-                label = -1
+            keys = list(self.env_dict.keys())
+            keys.remove(env)
+            another_env = np.random.choice(keys)
+            label = -1
         
         another_csi_path = np.random.choice(self.env_dict[another_env])
         another_amp, another_pha = self._get_csi(another_csi_path)
@@ -180,7 +179,7 @@ class CSI2Mask_Dataset(Dataset):
         mask_path = csi_path.replace('npy', 'img').replace('.npz', '_mask.png')
         mask = self._get_mask(mask_path)
 
-        if self.mode == 'train':
+        if self.mode == 'train' or self.mode == 'val':
             return [amp, pha, mask], [another_amp, another_pha], torch.tensor(label)
         else:
             return amp, pha, mask

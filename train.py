@@ -16,6 +16,17 @@ import torchvision
 import torch
 import yaml
 
+torch.set_float32_matmul_precision('medium')
+
+def make_img_grid(mask, out):
+    images_to_log = torch.cat([
+        mask[:6], out[:6],
+        mask[6:12], out[6:12],
+        mask[12:18], out[12:18]
+    ], dim=0)
+    img_grid = torchvision.utils.make_grid(images_to_log, nrow=6)
+    return img_grid
+
 class EncoderLightning(LightningModule):
     def __init__(self, config, modelconfig):
         super().__init__()
@@ -28,7 +39,7 @@ class EncoderLightning(LightningModule):
         self.decoder = Decoder()
         # <--------------------------------------Load pre-trained VAE Decoder-------------------------------------->
         if self.config['decoder_weight'] is not None:
-            print(f'[INFO] Load pre-trained VAE Decoder from {self.config['decoder_weight']}')
+            print(f"[INFO] Load pre-trained VAE Decoder from {self.config['decoder_weight']}")
             decoder_weight = torch.load(self.config['decoder_weight'])
             for name, param in self.decoder.named_parameters():
                 if name in decoder_weight:
@@ -108,11 +119,7 @@ class EncoderLightning(LightningModule):
         self.log('train/lr', self.optimizers().state_dict()['param_groups'][0]['lr'], on_step=True, prog_bar=True, logger=True)
         # log image
         if batch_idx % 1000 == 0:
-            images_to_log = torch.cat([
-                mask[:4], out[:4],
-                mask[4:8], out[4:8]
-            ], dim=0)
-            img_grid = torchvision.utils.make_grid(images_to_log, nrow=4)
+            img_grid = make_img_grid(mask, out)
             self.logger.experiment.add_images('train/images', img_grid, self.global_step, dataformats="CHW")
 
         return total_loss
@@ -145,11 +152,7 @@ class EncoderLightning(LightningModule):
 
         # log image
         if batch_idx == 0:
-            images_to_log = torch.cat([
-                mask[:4], out[:4],
-                mask[4:8], out[4:8]
-            ], dim=0)
-            img_grid = torchvision.utils.make_grid(images_to_log, nrow=4)
+            img_grid = make_img_grid(mask, out)
             self.logger.experiment.add_images('val/images', img_grid, self.global_step, dataformats="CHW")
     
     def test_step(self, batch, batch_idx):
@@ -180,11 +183,7 @@ class EncoderLightning(LightningModule):
 
         # log image
         if batch_idx == 0:
-            images_to_log = torch.cat([
-                mask[:4], out[:4],
-                mask[4:8], out[4:8]
-            ], dim=0)
-            img_grid = torchvision.utils.make_grid(images_to_log, nrow=4)
+            img_grid = make_img_grid(mask, out)
             self.logger.experiment.add_images('test/images', img_grid, self.global_step, dataformats="CHW")
 
 
@@ -246,10 +245,10 @@ def main(config):
 
 if __name__ == '__main__':
     config = {
-        'lr': 1e-5,
-        'batch_size': 32,
-        'num_workers': 4,
-        'epochs': 100,
+        'lr': 1e-4,
+        'batch_size': 16,
+        'num_workers': 8,
+        'epochs': 20,
         'optimizer': 'SGD',
         'model_config_path': './model_config.yaml',
         'data_root': '/root/SSD/PiWiFi/NYCU/', # /root/SSD/PiWiFi/NYCU/

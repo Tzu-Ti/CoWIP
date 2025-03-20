@@ -5,6 +5,7 @@ from torchmetrics import KLDivergence
 
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import EarlyStopping
 
 from torch.utils.data import DataLoader
 from datas.dataset import Mask_Dataset
@@ -15,6 +16,15 @@ import torch
 import yaml
 
 torch.set_float32_matmul_precision('medium')
+
+def make_img_grid(mask, out):
+    images_to_log = torch.cat([
+        mask[:6], out[:6],
+        mask[6:12], out[6:12],
+        mask[12:18], out[12:18]
+    ], dim=0)
+    img_grid = torchvision.utils.make_grid(images_to_log, nrow=6)
+    return img_grid
 
 class EncoderLightning(LightningModule):
     def __init__(self, config, modelconfig):
@@ -39,7 +49,6 @@ class EncoderLightning(LightningModule):
         self.W_KL = 1
         self.W_SSIM = 1
         self.W_DICE = 10
-
 
     def forward(self, mask):
         # VAE net
@@ -74,11 +83,7 @@ class EncoderLightning(LightningModule):
         self.log('train/lr', self.optimizers().state_dict()['param_groups'][0]['lr'], on_step=True, prog_bar=True, logger=True)
         # log image
         if batch_idx % 1000 == 0:
-            images_to_log = torch.cat([
-                mask[:4], out[:4],
-                mask[4:8], out[4:8]
-            ], dim=0)
-            img_grid = torchvision.utils.make_grid(images_to_log, nrow=4)
+            img_grid = make_img_grid(mask, out)
             self.logger.experiment.add_images('train/images', img_grid, self.global_step, dataformats="CHW")
 
         return total_loss
@@ -107,11 +112,7 @@ class EncoderLightning(LightningModule):
 
         # log image
         if batch_idx == 0:
-            images_to_log = torch.cat([
-                mask[:4], out[:4],
-                mask[4:8], out[4:8]
-            ], dim=0)
-            img_grid = torchvision.utils.make_grid(images_to_log, nrow=4)
+            img_grid = make_img_grid(mask, out)
             self.logger.experiment.add_images('val/images', img_grid, self.global_step, dataformats="CHW")
     
     def test_step(self, batch, batch_idx):
@@ -138,11 +139,7 @@ class EncoderLightning(LightningModule):
 
         # log image
         if batch_idx == 0:
-            images_to_log = torch.cat([
-                mask[:4], out[:4],
-                mask[4:8], out[4:8]
-            ], dim=0)
-            img_grid = torchvision.utils.make_grid(images_to_log, nrow=4)
+            img_grid = make_img_grid(mask, out)
             self.logger.experiment.add_images('test/images', img_grid, self.global_step, dataformats="CHW")
 
     def configure_optimizers(self):
@@ -189,10 +186,13 @@ def main(config):
 
     # Create Tensorboard logger
     logger = TensorBoardLogger("lightning_logs", name="VAE")
+
+    # Create Early Stopping
+    early_stopping = EarlyStopping(monitor="val/total_loss", patience=5, mode="min")
     
     # Create Trainer
     if config['mode'] == 'train':
-        trainer = Trainer(max_epochs=config['epochs'], logger=logger)
+        trainer = Trainer(max_epochs=config['epochs'], logger=logger, callbacks=[early_stopping])
         trainer.fit(model, train_dataloader, val_dataloader)
     elif config['mode'] == 'test':
         trainer = Trainer(logger=logger)
