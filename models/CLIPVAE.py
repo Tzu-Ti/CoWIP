@@ -110,9 +110,11 @@ class Decoder(nn.Module):
 class VAE(nn.Module):
     def __init__(self, activation='leakyrelu') -> None:
         super(VAE, self).__init__()
-        self.encoder = Encoder(activation=activation)
+        # self.encoder = Encoder(activation=activation)
+        self.clip_model, self.preprocess = clip.load("RN50")
         self.decoder = Decoder(activation=activation)
-        self.feature_size = self.encoder.feature_size
+        # self.feature_size = self.encoder.feature_size
+        self.feature_size = [1, 1]
         self.latent_dim = 1024*self.feature_size[0]*self.feature_size[1]
         print(f"[MODEL] Latent dimension: 1024*{self.feature_size[0]}*{self.feature_size[1]} = {self.latent_dim}")
         self.fc_mu = nn.Sequential(
@@ -131,14 +133,17 @@ class VAE(nn.Module):
         return mu + eps*std
     
     def forward(self, x):
-        x = self.encoder(x)
+        # x = self.encoder(x)
+        x = self.clip_model.encode_image(x)
+        print(f"[MODEL] Encoded image shape: {x.shape}")
+        raise
         x = x.view(-1, self.latent_dim)
         mu, logvar = self.fc_mu(x), self.fc_logvar(x)
         z = self.reparameterize(mu, logvar)
         z = self.fc(z)
         z = z.view(-1, 1024, self.feature_size[0], self.feature_size[1])
         x = self.decoder(z)
-        return z, x, mu, logvar
+        return x, mu, logvar
 
 class VAE_Finetune(nn.Module):
     def __init__(self, activation='leakyrelu') -> None:
@@ -170,37 +175,3 @@ class VAE_Finetune(nn.Module):
         z = z.view(-1, 1024, self.feature_size[0], self.feature_size[1])
 
         return z
-
-class CLIPVAE(nn.Module):
-    def __init__(self, activation='leakyrelu', teacher_model='RN50') -> None:
-        super(CLIPVAE, self).__init__()
-        self.CLIP_model, _ = clip.load(teacher_model)
-        print(f"[MODEL] CLIP model: {teacher_model}")
-        self.decoder = Decoder(activation=activation)
-        self.feature_size = [1, 1]
-        self.latent_dim = 1024*self.feature_size[0]*self.feature_size[1]
-        print(f"[MODEL] Latent dimension: 1024*{self.feature_size[0]}*{self.feature_size[1]} = {self.latent_dim}")
-        self.fc_mu = nn.Sequential(
-            nn.Linear(self.latent_dim , self.latent_dim),
-        )
-        self.fc_logvar = nn.Sequential(
-            nn.Linear(self.latent_dim , self.latent_dim),
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(self.latent_dim , self.latent_dim),
-        )
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5*logvar)
-        eps = torch.randn_like(std)
-        return mu + eps*std
-    
-    def forward(self, x):
-        x = self.CLIP_model.encode_image(x).float()
-        x = x.view(-1, self.latent_dim)
-        mu, logvar = self.fc_mu(x), self.fc_logvar(x)
-        z = self.reparameterize(mu, logvar)
-        z = self.fc(z)
-        z = z.view(-1, 1024, self.feature_size[0], self.feature_size[1])
-        x = self.decoder(z)
-        return x, mu, logvar

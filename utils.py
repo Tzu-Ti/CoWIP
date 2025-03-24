@@ -11,7 +11,7 @@ import os
 def random_src_mask(shape: list, ratio: float = 0.):
     mask = torch.rand(shape)
     mask = mask < ratio
-    return mask
+    return mask.float()
 
 class ContrastiveLoss(nn.Module):
     def __init__(self):

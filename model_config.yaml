@@ -27,7 +27,7 @@ ERC_Transformer:
 AggregationBlock:
   in_length: 51
   in_channels: 1536
-  out_length: 12
+  out_length: 1
   out_channels: 1024
   activation: 'gelu'
   dropout: 0.1
@@ -35,8 +35,8 @@ AggregationBlock:
 FullModel:
   vae_latent_shape:
     - 1024
-    - 3
-    - 4
+    - 1
+    - 1
   activation: 'gelu'
   dropout: 0.1
   aggregation: 'cross'
