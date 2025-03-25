@@ -8,6 +8,8 @@ import numpy as np
 from PIL import Image
 import os
 
+import clip
+
 def get_data_list(json_path: str, mode: str):
     """
     Get the data list from the json file
@@ -29,7 +31,7 @@ def get_data_list(json_path: str, mode: str):
 class Mask_Dataset(Dataset):
     def __init__(self,
                  json_path: str, data_root: str, mode: str = 'train',
-                 size: tuple = (192, 256)):
+                 size: tuple = (192, 256), teacher_model: str = 'VAE'):
         """
         Mask dataset
         :param json_path: the file contain data path
@@ -37,16 +39,33 @@ class Mask_Dataset(Dataset):
         :param size: the size of mask
         """
         self.mode = mode
+        self.teacher_model = teacher_model
 
         # Get the data list
         self.data_list = get_data_list(json_path, mode)
         self.data_list = [os.path.join(data_root, data) for data in self.data_list]
 
         # For transform mask data
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Resize(size, interpolation=InterpolationMode.NEAREST),
-        ])
+        if mode != 'train':
+            self.transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Resize(
+                    size, interpolation=InterpolationMode.NEAREST),
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Resize(
+                    size, interpolation=InterpolationMode.NEAREST),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomVerticalFlip(),
+                transforms.RandomRotation(90),
+            ])
+
+        if self.teacher_model != 'VAE':
+            _, self.preprocess = clip.load(self.teacher_model)
+        else:
+            _, self.preprocess = clip.load('RN50')
 
     def _get_mask(self, mask_path):
         """
@@ -56,22 +75,25 @@ class Mask_Dataset(Dataset):
         Return:
         mask: the mask data
         """
-        mask = Image.open(mask_path).convert('L')
+        image = Image.open(mask_path)
+        
+        mask = image.convert('L')
         mask = self.transform(mask).float()
 
-        return mask
+        # clip_mask = image.convert('RGB')
+        # clip_mask = self.preprocess(clip_mask).float()
+        # clip_mask = None
+
+        return mask, mask
 
     def __getitem__(self, index):
         csi_path = self.data_list[index]
 
         # mask
         mask_path = csi_path.replace('npy', 'img').replace('.npz', '_mask.png')
-        mask = self._get_mask(mask_path)
+        mask, clip_mask = self._get_mask(mask_path)
 
-        if self.mode == 'train':
-            return mask
-        else:
-            return mask
+        return mask, clip_mask
 
     def __len__(self):
         return len(self.data_list)

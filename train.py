@@ -1,16 +1,18 @@
 from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
-from torchmetrics.segmentation import DiceScore
 from torchmetrics.classification import BinaryJaccardIndex
+from torchmetrics.segmentation import DiceScore
 from torchmetrics import KLDivergence
 
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import EarlyStopping
 
 from utils import random_src_mask, ContrastiveLoss
 from datas.dataset import CSI2Mask_Dataset
 from torch.utils.data import DataLoader
 from models.FullModel import CSIEncoder
-from models.VAE import Decoder
+from models.VAE import VAE, Decoder
+from Loss import dice_loss as DICE
 from torch import nn
 import torchvision
 import torch
@@ -27,7 +29,7 @@ def make_img_grid(mask, out):
     img_grid = torchvision.utils.make_grid(images_to_log, nrow=6)
     return img_grid
 
-class EncoderLightning(LightningModule):
+class CSIEncoderLightning(LightningModule):
     def __init__(self, config, modelconfig):
         super().__init__()
         self.config = config
@@ -35,21 +37,21 @@ class EncoderLightning(LightningModule):
         self.save_hyperparameters()
         # Create CSI Encoder
         self.encoder = CSIEncoder(modelconfig)
+        # Create pre-trained VAE
+        self.vae = VAE()
         # Create VAE Decoder
         self.decoder = Decoder()
-        # <--------------------------------------Load pre-trained VAE Decoder-------------------------------------->
-        if self.config['decoder_weight'] is not None:
-            print(f"[INFO] Load pre-trained VAE Decoder from {self.config['decoder_weight']}")
-            decoder_weight = torch.load(self.config['decoder_weight'])
-            for name, param in self.decoder.named_parameters():
-                if name in decoder_weight:
-                    param.data = decoder_weight[name]
-                    param.requires_grad = False
-                else:
-                    print(f'[Warning] \"{name}\"<- parameter not in pre-trained weight!')
-            print('[INFO] VAE Decoder loaded successfully!')
-            decoder_weight = None
-        # <-------------------------------------------------------------------------------------------------------->
+        
+        checkpoint = torch.load(config['ckpt_path'])
+        decoder_state_dict = {k: v for k, v in checkpoint.items() if 'decoder' in k}
+        self.decoder.load_state_dict(decoder_state_dict, strict=False)
+        self.vae.load_state_dict(checkpoint['state_dict'], strict=False)
+        for param in self.decoder.parameters():
+            param.requires_grad = False
+        for param in self.vae.parameters():
+            param.requires_grad = False
+        checkpoint = None
+        
         # Loss functions and metrics
         self.total_loss = None
         self.mse = nn.MSELoss()
@@ -62,6 +64,7 @@ class EncoderLightning(LightningModule):
         self.IoU = BinaryJaccardIndex(threshold=0.5)
 
         # Loss weights
+        self.W_KD = 10
         self.W_MSE = 40
         self.W_BCE = 10
         self.W_KL = 100
@@ -69,43 +72,48 @@ class EncoderLightning(LightningModule):
         self.W_DICE = 3
         self.W_CL = 0.5
 
-    def forward(self, amp, pha):
+    def forward(self, amp, pha, mask):
         # create random mask for self-attention
         src_mask = random_src_mask([pha.shape[1], pha.shape[1]], 0.1).to(self.device)
 
-        # Encoder
+        # CSI Encoder
         if self.encoder.ERC.return_channel_stream:
-            z, mu, logvar, amp_channel, pha_channel = self.encoder(amp, pha, src_mask)
+            csi_z, mu, logvar, amp_channel, pha_channel = self.encoder(amp, pha, src_mask)
         else:
-            z, mu, logvar = self.encoder(amp, pha, src_mask)
+            csi_z, mu, logvar = self.encoder(amp, pha, src_mask)
+
+        # Pre-trained VAE
+        vae_z, _, _, _ = self.vae(mask)
 
         # Decoder
-        out = self.decoder(z)
+        out = self.decoder(csi_z)
 
         if self.encoder.ERC.return_channel_stream:
-            return out, mu, logvar, amp_channel, pha_channel
+            return out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z
         else:
-            return out, mu, logvar
+            return out, mu, logvar, csi_z, vae_z
     
     def training_step(self, batch, batch_idx):
         [amp, pha, mask], [another_amp, another_pha], label = batch
 
         # forward
-        out, mu, logvar, amp_channel, pha_channel = self.forward(amp, pha)
+        out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z = self.forward(amp, pha, mask)
         # for contrastive learning
-        _, _, _, another_amp_channel, another_pha_channel = self.forward(another_amp, another_pha)
+        _, _, _, another_amp_channel, another_pha_channel, _, _ = self.forward(another_amp, another_pha, mask)
 
         # loss
+        KD_loss = self.mse(csi_z, vae_z) * self.W_KD
         mse_loss = self.mse(torch.sigmoid(out), mask) * self.W_MSE
         bce_loss = self.BCE(out, mask) * self.W_BCE
-        dice_loss = (1 - self.DICE(torch.sigmoid(out), mask)) * self.W_DICE
+        # dice_loss = (1 - self.DICE(torch.sigmoid(out), mask)) * self.W_DICE
+        dice_loss = DICE(torch.sigmoid(out).squeeze(1), mask.squeeze(1)) * self.W_DICE
         kl_loss = (-0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())) * self.W_KL
-        kl_loss = torch.clamp(kl_loss, 0, 100)
+        kl_loss = torch.clip(kl_loss, 0, 100)
         ssim_loss = -self.ssim(torch.sigmoid(out).float(), mask.float()) * self.W_SSIM
         cl_loss = self.CL([amp_channel, pha_channel], [another_amp_channel, another_pha_channel], label) * self.W_CL
         
-        # total_loss = mse + bce + kl + ssim + dice
-        total_loss = mse_loss + bce_loss + dice_loss + kl_loss + ssim_loss + cl_loss
+        # total_loss = mse + bce + kl + ssim + dice + KD
+        total_loss = mse_loss + bce_loss + dice_loss + kl_loss + ssim_loss + cl_loss + KD_loss
 
         # log
         self.log('train/total_loss', total_loss, on_step=True, prog_bar=True, logger=True)
@@ -115,6 +123,7 @@ class EncoderLightning(LightningModule):
         self.log('train/kl', kl_loss, on_step=True, prog_bar=True, logger=True)
         self.log('train/ssim', -ssim_loss, on_step=True, prog_bar=True, logger=True)
         self.log('train/cl', cl_loss, on_step=True, prog_bar=True, logger=True)
+        self.log('train/KD', KD_loss, on_step=True, prog_bar=True, logger=True)
         # log learning rate
         self.log('train/lr', self.optimizers().state_dict()['param_groups'][0]['lr'], on_step=True, prog_bar=True, logger=True)
         # log image
@@ -128,18 +137,20 @@ class EncoderLightning(LightningModule):
         [amp, pha, mask], [another_amp, another_pha], label = batch
 
         # forward
-        out, mu, logvar, amp_channel, pha_channel = self.forward(amp, pha)
+        out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z = self.forward(amp, pha, mask)
 
         # loss
+        KD_loss = self.mse(csi_z, vae_z) * self.W_KD
         mse_loss = self.mse(torch.sigmoid(out), mask) * self.W_MSE
         bce_loss = self.BCE(out, mask) * self.W_BCE
-        dice_loss = (1 - self.DICE(torch.sigmoid(out), mask)) * self.W_DICE
+        # dice_loss = (1 - self.DICE(torch.sigmoid(out), mask)) * self.W_DICE
+        dice_loss = DICE(torch.sigmoid(out).squeeze(1), mask.squeeze(1)) * self.W_DICE
         ssim_loss = -self.ssim(torch.sigmoid(out).float(), mask.float()) * self.W_SSIM
         
         IoU = self.IoU(torch.sigmoid(out).float(), mask.long())
         
-        # total_loss = mse + bce + dice + ssim
-        total_loss = mse_loss + bce_loss + dice_loss + ssim_loss
+        # total_loss = mse + bce + dice + ssim + KD
+        total_loss = mse_loss + bce_loss + dice_loss + ssim_loss + KD_loss
 
         # log
         self.log('val/total_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
@@ -147,6 +158,7 @@ class EncoderLightning(LightningModule):
         self.log('val/bce', bce_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log('val/dice', dice_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log('val/ssim', -ssim_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('val/KD', KD_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
         self.log('val/IoU', IoU, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
@@ -159,12 +171,13 @@ class EncoderLightning(LightningModule):
         amp, pha, mask = batch
 
         # forward
-        out, mu, logvar, amp_channel, pha_channel = self.forward(amp, pha)
+        out, mu, logvar, amp_channel, pha_channel = self.forward(amp, pha, mask)
 
         # loss
         mse_loss = self.mse(torch.sigmoid(out), mask) * self.W_MSE
         bce_loss = self.BCE(out, mask) * self.W_BCE
-        dice_loss = (1 - self.DICE(torch.sigmoid(out), mask)) * self.W_DICE
+        # dice_loss = (1 - self.DICE(torch.sigmoid(out), mask)) * self.W_DICE
+        dice_loss = DICE(torch.sigmoid(out).squeeze(1), mask.squeeze(1)) * self.W_DICE
         ssim_loss = -self.ssim(torch.sigmoid(out).float(), mask.float()) * self.W_SSIM
         
         IoU = self.IoU(torch.sigmoid(out).float(), mask.long())
@@ -190,13 +203,16 @@ class EncoderLightning(LightningModule):
     def configure_optimizers(self):
         # Optimizer
         if self.config['optimizer'] == 'SGD':
-            optimizer = torch.optim.SGD(self.parameters(), lr=self.config['lr'])
+            optimizer = torch.optim.SGD(self.parameters(), lr=self.config['lr'], momentum=0.9, weight_decay=1e-5)
         elif self.config['optimizer'] == 'Adam':
             optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'], betas=(0.9, 0.999), eps=1e-8)
+        elif self.config['optimizer'] == 'AdamW':
+            optimizer = torch.optim.AdamW(self.parameters(), lr=self.config['lr'], betas=(0.9, 0.999), eps=1e-8)
         else:
-            optimizer = torch.optim.SGD(self.parameters(), lr=self.config['lr'])
+            optimizer = torch.optim.SGD(self.parameters(), lr=self.config['lr'], momentum=0.9, weight_decay=1e-5)
         # Scheduler
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=100)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=1500)
+        # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30, 60, 90, 120, 250], gamma=0.7)
         scheduler_setup = {
             "scheduler": scheduler,
             "interval": "step",
@@ -217,7 +233,7 @@ def main(config):
         modelconfig = yaml.load(f, Loader=yaml.CLoader)
 
     # Create lighning model
-    model = EncoderLightning(config=config, modelconfig=modelconfig)
+    model = CSIEncoderLightning(config=config, modelconfig=modelconfig)
 
     # Create Dataloader
     dataset = CSI2Mask_Dataset(json_path=config['train&val_json_path'], data_root=config['data_root'], mode='train')
@@ -235,20 +251,18 @@ def main(config):
 
     # Create Trainer
     if config['mode'] == 'train':
-        trainer = Trainer(max_epochs=config['epochs'],
-                        strategy="ddp_find_unused_parameters_true",
-                        logger=logger)
+        trainer = Trainer(max_epochs=config['epochs'], logger=logger, precision="16-mixed")
         trainer.fit(model, train_dataloader, val_dataloader)
     elif config['mode'] == 'test':
-        trainer = Trainer(strategy="ddp_find_unused_parameters_true", logger=logger)
+        trainer = Trainer(logger=logger)
         trainer.test(model, test_dataloader, ckpt_path=config['ckpt_path'])
 
 if __name__ == '__main__':
     config = {
-        'lr': 1e-4,
-        'batch_size': 16,
+        'lr': 1e-3,
+        'batch_size': 112,
         'num_workers': 8,
-        'epochs': 20,
+        'epochs': 30,
         'optimizer': 'SGD',
         'model_config_path': './model_config.yaml',
         'data_root': '/root/SSD/PiWiFi/NYCU/', # /root/SSD/PiWiFi/NYCU/
@@ -256,8 +270,7 @@ if __name__ == '__main__':
         'val_json_path': '/root/terry/CoWIP/datas/NYCU/val.json',
         'test_json_path': '/root/terry/CoWIP/datas/NYCU/test.json',
         'mode': 'train',
-        'ckpt_path': '/root/workspace/CoWIP/lightning_logs/WiFi2Seg/version_6/checkpoints/epoch=4-step=11705.ckpt',
-        'decoder_weight': None
+        'ckpt_path': '/root/terry/CoWIP/lightning_logs/VAE/version_68/checkpoints/epoch=23-step=17184.ckpt',
     }
 
     main(config=config)
