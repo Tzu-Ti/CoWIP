@@ -122,7 +122,7 @@ class CSI2Mask_Dataset(Dataset):
         # Accroding to the Env, classify the data into different Env
         self.env_dict = {}
         for data in self.data_list:
-            env = data.split('/')[5]
+            env = self._get_env(data)
             if env not in self.env_dict:
                 self.env_dict[env] = []
             self.env_dict[env].append(data)
@@ -132,6 +132,20 @@ class CSI2Mask_Dataset(Dataset):
             transforms.ToTensor(),
             transforms.Resize(size, interpolation=InterpolationMode.NEAREST),
         ])
+
+    def _get_env(self, csi_path: str):
+        """
+        Get the number of environment of the CSI data
+        :param csi_path: the path of the npz file
+
+        Return:
+        env: the number of environment
+        """
+        parts = csi_path.split('/')
+        for part in parts:
+            if 'Env' in part or '_set' in part:
+                env = part
+        return env
 
     def _normalize(self, x: torch.Tensor, mean: float = 0, std: float = 0.5):
         """
@@ -181,7 +195,7 @@ class CSI2Mask_Dataset(Dataset):
 
     def __getitem__(self, index):
         csi_path = self.data_list[index]
-        env = csi_path.split('/')[5]
+        env = self._get_env(csi_path)
         amp, pha = self._get_csi(csi_path)
         
         # choose another data in the same or different env
