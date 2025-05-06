@@ -8,3 +8,6 @@ val.json
 
 # training logs
 lightning_logs
+
+# test code
+test_clip

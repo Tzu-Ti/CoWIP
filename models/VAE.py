@@ -26,7 +26,15 @@ class Encoder(nn.Module):
         #     ResidualBlock(inchannels[-1], inchannels[-1], self.activation),
         # )
         self.bottle_neck = nn.Sequential(
-            nn.Conv2d(inchannels[-1], inchannels[-1], kernel_size=(3, 4), stride=1, padding=0),
+            nn.Conv2d(inchannels[-1], inchannels[-1] // 2, kernel_size=1),
+            nn.BatchNorm2d(inchannels[-1] // 2),
+            Activation(self.activation),
+            
+            nn.Conv2d(inchannels[-1] // 2, inchannels[-1] // 2, kernel_size=(3, 4), stride=1, padding=0),
+            nn.BatchNorm2d(inchannels[-1] // 2),
+            Activation(self.activation),
+            
+            nn.Conv2d(inchannels[-1] // 2, inchannels[-1], kernel_size=1),
             nn.BatchNorm2d(inchannels[-1]),
             Activation(self.activation),
         )
@@ -64,15 +72,15 @@ class Decoder(nn.Module):
         #     ResidualBlock(inchannels[0], inchannels[0], self.activation),
         # )
         self.bottle_neck = nn.Sequential(
-            nn.ConvTranspose2d(inchannels[0], inchannels[0], kernel_size=(3, 4), stride=1, padding=0),
+            nn.ConvTranspose2d(1024, inchannels[0], kernel_size=(3, 4), stride=1, padding=0),
             nn.BatchNorm2d(inchannels[0]),
             Activation(self.activation),
         )
         print("[MODEL] Create VAE Decoder:")
         self.layers = self._make_layers(inchannels)
         print(f"\tOut layer info-> <layer:0, in_channels:{inchannels[-1]}, out_channels:16>")
-        print(f"\tOut layer info-> <layer:1, in_channels:16, out_channels:1>")
-        print(f"\tOut layer info-> <layer:2, in_channels:1, out_channels:1>")
+        print(f"\tOut layer info-> <layer:1, in_channels:16, out_channels:4>")
+        print(f"\tOut layer info-> <layer:2, in_channels:4, out_channels:1>")
         print(f"\tOut layer info-> <output activation: None>")
         self.out_block = nn.Sequential(
             nn.ConvTranspose2d(inchannels[-1], 16, 5, stride=2, padding=2, output_padding=1),
@@ -172,14 +180,25 @@ class VAE_Finetune(nn.Module):
         return z
 
 class CLIPVAE(nn.Module):
-    def __init__(self, activation='leakyrelu', teacher_model='RN50') -> None:
+    def __init__(self, activation='leakyrelu', clip_pretrain_model='RN50') -> None:
         super(CLIPVAE, self).__init__()
-        self.CLIP_model, _ = clip.load(teacher_model)
-        print(f"[MODEL] CLIP model: {teacher_model}")
+        self.CLIP_model, _ = clip.load(clip_pretrain_model)
+        print(f"[MODEL] CLIP model: {clip_pretrain_model}")
         self.decoder = Decoder(activation=activation)
         self.feature_size = [1, 1]
         self.latent_dim = 1024*self.feature_size[0]*self.feature_size[1]
         print(f"[MODEL] Latent dimension: 1024*{self.feature_size[0]}*{self.feature_size[1]} = {self.latent_dim}")
+        self.adapter = nn.Sequential(
+            nn.Conv2d(in_channels=2048, out_channels=1024, kernel_size=(3,3), stride=1, padding=0),
+            nn.BatchNorm2d(1024),
+            Activation(activation),
+            nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=(3,3), stride=1, padding=0),
+            nn.BatchNorm2d(1024),
+            Activation(activation),
+            nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=(3,3), stride=1, padding=0),
+            nn.BatchNorm2d(1024),
+            Activation(activation)
+        )
         self.fc_mu = nn.Sequential(
             nn.Linear(self.latent_dim , self.latent_dim),
         )
@@ -197,10 +216,12 @@ class CLIPVAE(nn.Module):
     
     def forward(self, x):
         x = self.CLIP_model.encode_image(x).float()
-        x = x.view(-1, self.latent_dim)
+        x = self.adapter(x)
+        x = x.contiguous().view(-1, self.latent_dim)
+        # x = x.view(-1, self.latent_dim)
         mu, logvar = self.fc_mu(x), self.fc_logvar(x)
         z = self.reparameterize(mu, logvar)
         z = self.fc(z)
         z = z.view(-1, 1024, self.feature_size[0], self.feature_size[1])
         x = self.decoder(z)
-        return x, mu, logvar
+        return z, x, mu, logvar

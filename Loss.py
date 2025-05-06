@@ -103,3 +103,6 @@ def self_contrastive_loss(x1, x2):
     x1 = x1.view(x1.size(0), -1)
     x2 = x2.view(x2.size(0), -1)
     return (1 - torch.mean(x1 + x2)) + torch.mean(x1 * x2)
+
+def kl_divergence_loss(mu, logvar):
+    return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())

@@ -9,23 +9,23 @@ from torchmetrics.classification import BinaryJaccardIndex
 from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
 from torchmetrics.segmentation import DiceScore
 
-
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 
-from datas.dataset import Mask_Dataset
-from models.VAE import VAE
+from datas.dataset import Mask_CLIP_Dataset
+from models.VAE import CLIPVAE
 from Loss import dice_loss as DICE
 from Loss import kl_divergence_loss as KLD
 
 torch.set_float32_matmul_precision('medium')
 
-def make_img_grid(mask, out):
+def make_img_grid(org_rgb, mask, out):
+    mask = mask.repeat(1, 3, 1, 1)
+    out = out.repeat(1, 3, 1, 1)
     images_to_log = torch.cat([
-        mask[:6], out[:6],
-        mask[6:12], out[6:12],
-        mask[12:18], out[12:18]
+        org_rgb[:6], mask[:6], out[:6],
+        org_rgb[6:12], mask[6:12], out[6:12],
     ], dim=0)
     img_grid = torchvision.utils.make_grid(images_to_log, nrow=6)
     return img_grid
@@ -38,9 +38,20 @@ class VAELightning(LightningModule):
 
         # Create VAE model
         if config['compile']:
-            self.net = torch.compile(VAE(activation='leakyrelu'))
+            self.net = torch.compile(CLIPVAE(activation='leakyrelu', clip_pretrain_model=config['clip_pretrain_model']))
         else:
-            self.net = VAE(activation='leakyrelu')
+            self.net = CLIPVAE(activation='leakyrelu', clip_pretrain_model=config['clip_pretrain_model'])
+        print(f"[INFO] Load pre-trained CLIP Encoder from {self.config['clip_pretrain_model']}")
+
+        # I just want to calculate the size of different components in the model.
+        self.encoder = self.net.CLIP_model.visual
+        self.adapter = self.net.adapter
+        self.decoder = self.net.decoder
+
+        # Load pre-trained CLIP model & freeze parameters
+        for name, param in self.net.CLIP_model.named_parameters():
+            param.requires_grad = False
+        print('[INFO] Pre-trained CLIP Vision encoder loaded successfully!')
 
         # Loss functions and metrics
         self.mse = nn.MSELoss(reduction='mean')
@@ -61,8 +72,8 @@ class VAELightning(LightningModule):
         return out, mu, logvar
     
     def training_step(self, batch, batch_idx):
-        mask = batch
-        out, mu, logvar = self.forward(mask)
+        mask, clip_rgb, org_rgb = batch
+        out, mu, logvar = self.forward(clip_rgb)
 
         mse_loss = self.mse(torch.sigmoid(out), mask) * self.W_MSE
         bce_loss = self.BCE(out, mask) * self.W_BCE
@@ -85,14 +96,14 @@ class VAELightning(LightningModule):
 
         # log image
         if batch_idx % 1000 == 0:
-            img_grid = make_img_grid(mask, out)
+            img_grid = make_img_grid(org_rgb, mask, out)
             self.logger.experiment.add_images('train/images', img_grid, self.global_step, dataformats="CHW")
 
         return total_loss
     
     def validation_step(self, batch, batch_idx, dataloader_idx):
-        mask = batch
-        out, mu, logvar = self.forward(mask)
+        mask, clip_rgb, org_rgb = batch
+        out, mu, logvar = self.forward(clip_rgb)
 
         mse_loss = self.mse(torch.sigmoid(out), mask) * self.W_MSE
         bce_loss = self.BCE(out, mask) * self.W_BCE
@@ -122,12 +133,12 @@ class VAELightning(LightningModule):
 
         # log image
         if batch_idx == 0:
-            img_grid = make_img_grid(mask, out)
+            img_grid = make_img_grid(org_rgb, mask, out)
             self.logger.experiment.add_images(f'val/{prefix}/images', img_grid, self.global_step, dataformats="CHW")
     
     def test_step(self, batch, batch_idx):
-        mask = batch
-        out, mu, logvar = self.forward(mask)
+        mask, clip_rgb, org_rgb = batch
+        out, mu, logvar = self.forward(clip_rgb)
 
         mse_loss = self.mse(torch.sigmoid(out), mask) * self.W_MSE
         bce_loss = self.BCE(out, mask) * self.W_BCE
@@ -147,7 +158,7 @@ class VAELightning(LightningModule):
 
         # log image
         if batch_idx == 0:
-            img_grid = make_img_grid(mask, out)
+            img_grid = make_img_grid(org_rgb, mask, out)
             self.logger.experiment.add_images('test/images', img_grid, self.global_step, dataformats="CHW")
 
     def configure_optimizers(self):
@@ -173,7 +184,7 @@ class VAELightning(LightningModule):
 
 def main(config):
     """
-    Main function for training
+    Main function for training CLIPVAE model with PyTorch Lightning.
     :param config: dict, configuration for training and file paths
     """
 
@@ -184,12 +195,13 @@ def main(config):
     # Initialize LightningModule
     model = VAELightning(config=config, modelconfig=modelconfig)
 
-        # Setup dataset and dataloaders
+    # Setup dataset and dataloaders
     # =============================train=============================
-    train_dataset = Mask_Dataset(
+    train_dataset = Mask_CLIP_Dataset(
         json_path=config['train&val_json_path'],
         data_root=config['data_root'],
-        mode='train'
+        mode='train',
+        clip_pretrain_model=config['clip_pretrain_model']
     )
     train_loader = DataLoader(
         train_dataset,
@@ -200,10 +212,11 @@ def main(config):
         drop_last=True
     )
     # =============================val=============================
-    val_dataset = Mask_Dataset(
+    val_dataset = Mask_CLIP_Dataset(
         json_path=config['train&val_json_path'],
         data_root=config['data_root'],
-        mode='val'
+        mode='val',
+        clip_pretrain_model=config['clip_pretrain_model']
     )
     val_loader_00 = DataLoader(
         val_dataset,
@@ -212,10 +225,11 @@ def main(config):
         num_workers=config['num_workers'],
         pin_memory=False
     )
-    val_dataset = Mask_Dataset(
+    val_dataset = Mask_CLIP_Dataset(
         json_path=config['val_json_path'],
         data_root=config['data_root'],
-        mode='val'
+        mode='val',
+        clip_pretrain_model=config['clip_pretrain_model']
     )
     val_loader_01 = DataLoader(
         val_dataset,
@@ -226,10 +240,11 @@ def main(config):
     )
     val_loaders = [val_loader_00, val_loader_01]
     # =============================test=============================
-    test_dataset = Mask_Dataset(
+    test_dataset = Mask_CLIP_Dataset(
         json_path=config['test_json_path'],
         data_root=config['data_root'],
-        mode='test'
+        mode='test',
+        clip_pretrain_model=config['clip_pretrain_model']
     )
     test_loader = DataLoader(
         test_dataset,
@@ -240,7 +255,7 @@ def main(config):
     )
 
     # Setup Tensorboard logger
-    logger = TensorBoardLogger("lightning_logs", name="VAE")
+    logger = TensorBoardLogger("lightning_logs", name="CLIPVAE")
 
     # Setup callbacks
     callbacks = [
@@ -256,9 +271,9 @@ def main(config):
         save_top_k=5,
         monitor='val_loss',
         mode="min",
-        filename='VAE-{epoch:02d}-{step}-{val_loss:.2f}'
+        filename='CLIPVAE-{epoch:02d}-{step}-{total_loss:.2f}'
     )
-    
+
     # Initialize PyTorch Lightning Trainer
     if config['mode'] == 'train':
         trainer = Trainer(
@@ -278,7 +293,7 @@ def main(config):
 if __name__ == '__main__':
     config = {
         'lr': 1e-3,
-        'batch_size': 256,
+        'batch_size': 96,
         'num_workers': 24,
         'epochs': 200,
         'optimizer': 'SGD',
@@ -291,11 +306,12 @@ if __name__ == '__main__':
         'test_json_path': '/root/terry/CoWIP/datas/NYCU/test.json',
         # resume setting
         'dirpath': None,
-        'ckpt_path': None
+        'ckpt_path': None,
+        # pre-trained model setting
+        'clip_pretrain_model': 'RN50',
+        # model list: ['RN50','RN101','RN50x4','RN50x16','RN50x64',
+        #              'ViT-B/32','ViT-B/16','ViT-L/14','ViT-L/14@336px']
     }
 
     main(config=config)
 
-    
-
-    

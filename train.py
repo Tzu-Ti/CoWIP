@@ -1,30 +1,44 @@
-from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
-from torchmetrics.classification import BinaryJaccardIndex
-from torchmetrics.segmentation import DiceScore
+import torch
+import torchvision
+import yaml
+from torch import nn
+from torch.utils.data import DataLoader
+
 from torchmetrics import KLDivergence
+from torchmetrics.classification import BinaryJaccardIndex
+from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
+from torchmetrics.segmentation import DiceScore
 
 from pytorch_lightning import LightningModule, Trainer
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import EarlyStopping
 
-from utils import random_src_mask, ContrastiveLoss
 from datas.dataset import CSI2Mask_Dataset
-from torch.utils.data import DataLoader
+from models.VAE import VAE, CLIPVAE, Decoder
+
 from models.FullModel import CSIEncoder
-from models.VAE import VAE, Decoder
 from Loss import dice_loss as DICE
-from torch import nn
-import torchvision
-import torch
-import yaml
+from Loss import kl_divergence_loss as KLD
+from utils import random_src_mask, ContrastiveLoss
 
 torch.set_float32_matmul_precision('medium')
 
-def make_img_grid(mask, out):
+def make_img_grid_for_clip(org_rgb, mask, vae_out, out):
+    mask = mask.repeat(1, 3, 1, 1)
+    vae_out = vae_out.repeat(1, 3, 1, 1)
+    out = out.repeat(1, 3, 1, 1)
     images_to_log = torch.cat([
-        mask[:6], out[:6],
-        mask[6:12], out[6:12],
-        mask[12:18], out[12:18]
+        org_rgb[:6], mask[:6], vae_out[:6], out[:6],
+        org_rgb[6:12], mask[6:12], vae_out[6:12], out[6:12],
+    ], dim=0)
+    img_grid = torchvision.utils.make_grid(images_to_log, nrow=6)
+    return img_grid
+
+def make_img_grid(mask, vae_out, out):
+    images_to_log = torch.cat([
+        mask[:6], vae_out[:6], out[:6],
+        mask[6:12], vae_out[6:12], out[6:12],
+        mask[12:18], vae_out[12:18], out[12:18]
     ], dim=0)
     img_grid = torchvision.utils.make_grid(images_to_log, nrow=6)
     return img_grid
@@ -33,44 +47,60 @@ class CSIEncoderLightning(LightningModule):
     def __init__(self, config, modelconfig):
         super().__init__()
         self.config = config
-        # save hyparparameters
         self.save_hyperparameters()
+
         # Create CSI Encoder
-        self.encoder = CSIEncoder(modelconfig)
+        if config['compile']:
+            self.encoder = torch.compile(CSIEncoder(modelconfig))
+            self.decoder = torch.compile(Decoder())
+        else:
+            self.encoder = CSIEncoder(modelconfig)
+            self.decoder = Decoder()
+
         # Create pre-trained VAE
-        self.vae = VAE()
-        # Create VAE Decoder
-        self.decoder = Decoder()
+        if config['teacher_arch'] == 'CLIPVAE':
+            self.teacher_arch = 'CLIPVAE'
+            self.vae = CLIPVAE(activation='leakyrelu', clip_pretrain_model=config['clip_pretrain_model'])
+        elif config['teacher_arch'] == 'VAE':
+            self.teacher_arch = 'VAE'
+            self.vae = VAE(activation='leakyrelu')
         
-        checkpoint = torch.load(config['ckpt_path'])
-        decoder_state_dict = {k: v for k, v in checkpoint.items() if 'decoder' in k}
-        self.decoder.load_state_dict(decoder_state_dict, strict=False)
-        self.vae.load_state_dict(checkpoint['state_dict'], strict=False)
-        for param in self.decoder.parameters():
-            param.requires_grad = False
-        for param in self.vae.parameters():
-            param.requires_grad = False
-        checkpoint = None
+        # Load decoder and teacher model & freeze parameters
+        if config['load_decoder']:    
+            checkpoint = torch.load(config['decoder_path'])
+            decoder_state_dict = {k.replace('net.','').replace('_orig_mod.','').replace('decoder.',''): v for k, v in checkpoint["state_dict"].items() if 'decoder' in k}
+            self.decoder.load_state_dict(decoder_state_dict)
+            for param in self.decoder.parameters():
+                param.requires_grad = False
+            checkpoint = None
+            decoder_state_dict = None
+        if config['teacher_arch']:
+            checkpoint = torch.load(config['teacher_path'])
+            vae_state_dict = {k.replace('net.','').replace('_orig_mod.',''): v for k, v in checkpoint["state_dict"].items()}
+            self.vae.load_state_dict(vae_state_dict, strict=False)
+            for param in self.vae.parameters():
+                param.requires_grad = False
+            checkpoint = None
+            vae_state_dict = None
         
         # Loss functions and metrics
-        self.total_loss = None
         self.mse = nn.MSELoss()
         self.BCE = nn.BCEWithLogitsLoss()
         self.ssim = SSIM(data_range=(0., 1.))
         self.DICE = DiceScore(num_classes=1, average="micro")
         self.KL = KLDivergence()
-
-        self.CL = ContrastiveLoss() # Contrastive loss
+        self.CL = ContrastiveLoss()
         self.IoU = BinaryJaccardIndex(threshold=0.5)
 
         # Loss weights
-        self.W_KD = 10
-        self.W_MSE = 40
-        self.W_BCE = 10
-        self.W_KL = 100
-        self.W_SSIM = 1
-        self.W_DICE = 3
-        self.W_CL = 0.5
+        self.W_KD = 1
+        self.W_MSE = 20 # 40
+        self.W_BCE = 5 # 10
+        self.W_DICE = 1.5 # 3
+        self.W_KL = 50 # 100
+        self.W_CL = 0.5 # 0.5
+
+        self.W_SSIM = 0.5 # 1
 
     def forward(self, amp, pha, mask):
         # create random mask for self-attention
@@ -83,194 +113,317 @@ class CSIEncoderLightning(LightningModule):
             csi_z, mu, logvar = self.encoder(amp, pha, src_mask)
 
         # Pre-trained VAE
-        vae_z, _, _, _ = self.vae(mask)
+        vae_z, vae_out, _, _ = self.vae(mask)
 
         # Decoder
         out = self.decoder(csi_z)
 
         if self.encoder.ERC.return_channel_stream:
-            return out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z
+            return out, vae_out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z
         else:
-            return out, mu, logvar, csi_z, vae_z
+            return out, vae_out, mu, logvar, csi_z, vae_z
     
     def training_step(self, batch, batch_idx):
-        [amp, pha, mask], [another_amp, another_pha], label = batch
+        [amp, pha, mask, clip_rgb, org_rgb], [another_amp, another_pha], label = batch
 
-        # forward
-        out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z = self.forward(amp, pha, mask)
-        # for contrastive learning
-        _, _, _, another_amp_channel, another_pha_channel, _, _ = self.forward(another_amp, another_pha, mask)
+        if self.teacher_arch == 'CLIPVAE':
+            out, vae_out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z = self.forward(amp, pha, clip_rgb)
+            # for contrastive learning
+            _, _, _, _, another_amp_channel, another_pha_channel, _, _= self.forward(another_amp, another_pha, clip_rgb)
+        elif self.teacher_arch == 'VAE':
+            out, vae_out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z = self.forward(amp, pha, mask)
+            # for contrastive learning
+            _, _, _, _, another_amp_channel, another_pha_channel, _, _= self.forward(another_amp, another_pha, mask)
 
-        # loss
-        KD_loss = self.mse(csi_z, vae_z) * self.W_KD
         mse_loss = self.mse(torch.sigmoid(out), mask) * self.W_MSE
         bce_loss = self.BCE(out, mask) * self.W_BCE
         # dice_loss = (1 - self.DICE(torch.sigmoid(out), mask)) * self.W_DICE
         dice_loss = DICE(torch.sigmoid(out).squeeze(1), mask.squeeze(1)) * self.W_DICE
-        kl_loss = (-0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())) * self.W_KL
-        kl_loss = torch.clip(kl_loss, 0, 100)
-        ssim_loss = -self.ssim(torch.sigmoid(out).float(), mask.float()) * self.W_SSIM
+        kl_loss = torch.clip(KLD(mu, logvar) * self.W_KL, 0, 100)
+        ssim_loss = (-self.ssim(torch.sigmoid(out).float(), mask.float())) * self.W_SSIM
         cl_loss = self.CL([amp_channel, pha_channel], [another_amp_channel, another_pha_channel], label) * self.W_CL
-        
-        # total_loss = mse + bce + kl + ssim + dice + KD
-        total_loss = mse_loss + bce_loss + dice_loss + kl_loss + ssim_loss + cl_loss + KD_loss
+        KD_loss = self.mse(csi_z, vae_z) * self.W_KD
 
-        # log
-        self.log('train/total_loss', total_loss, on_step=True, prog_bar=True, logger=True)
-        self.log('train/mse', mse_loss, on_step=True, prog_bar=True, logger=True)
-        self.log('train/bce', bce_loss, on_step=True, prog_bar=True, logger=True)
-        self.log('train/dice', dice_loss, on_step=True, prog_bar=True, logger=True)
-        self.log('train/kl', kl_loss, on_step=True, prog_bar=True, logger=True)
-        self.log('train/ssim', -ssim_loss, on_step=True, prog_bar=True, logger=True)
-        self.log('train/cl', cl_loss, on_step=True, prog_bar=True, logger=True)
-        self.log('train/KD', KD_loss, on_step=True, prog_bar=True, logger=True)
-        # log learning rate
-        self.log('train/lr', self.optimizers().state_dict()['param_groups'][0]['lr'], on_step=True, prog_bar=True, logger=True)
+        IoU = self.IoU(torch.sigmoid(out).float(), mask.long())
+
+        total_loss = mse_loss + bce_loss + dice_loss + kl_loss + cl_loss + ssim_loss + KD_loss
+
+        self.log_dict({
+            'train/total_loss': total_loss,
+            'train/mse': mse_loss/self.W_MSE,
+            'train/bce': bce_loss/self.W_BCE,
+            'train/dice': dice_loss/self.W_DICE,
+            'train/kl': kl_loss/self.W_KL,
+            'train/ssim': -ssim_loss/self.W_SSIM,
+            'train/cl': cl_loss/self.W_CL,
+            'train/KD': KD_loss/self.W_KD,
+            'train/IoU': IoU,
+            'train/lr': self.optimizers().param_groups[0]['lr'],
+        }, on_step=True, prog_bar=True, logger=True)
+
         # log image
         if batch_idx % 1000 == 0:
-            img_grid = make_img_grid(mask, out)
+            if self.teacher_arch == 'CLIPVAE':
+                img_grid = make_img_grid_for_clip(org_rgb, mask, vae_out, out)
+            elif self.teacher_arch == 'VAE':
+                img_grid = make_img_grid(mask, vae_out, out)
             self.logger.experiment.add_images('train/images', img_grid, self.global_step, dataformats="CHW")
 
         return total_loss
     
-    def validation_step(self, batch, batch_idx):
-        [amp, pha, mask], [another_amp, another_pha], label = batch
+    def validation_step(self, batch, batch_idx, dataloader_idx):
+        amp, pha, mask, clip_rgb, org_rgb = batch
 
-        # forward
-        out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z = self.forward(amp, pha, mask)
+        if self.teacher_arch == 'CLIPVAE':
+            out, vae_out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z = self.forward(amp, pha, clip_rgb)
+        elif self.teacher_arch == 'VAE':
+            out, vae_out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z = self.forward(amp, pha, mask)
 
-        # loss
+        mse_loss = self.mse(torch.sigmoid(out), mask) * self.W_MSE
+        bce_loss = self.BCE(out, mask) * self.W_BCE
+        dice_loss = (1 - self.DICE(torch.sigmoid(out), mask)) * self.W_DICE
+        dice_loss = DICE(torch.sigmoid(out).squeeze(1), mask.squeeze(1)) * self.W_DICE
+        ssim_loss = (-self.ssim(torch.sigmoid(out).float(), mask.float())) * self.W_SSIM
         KD_loss = self.mse(csi_z, vae_z) * self.W_KD
-        mse_loss = self.mse(torch.sigmoid(out), mask) * self.W_MSE
-        bce_loss = self.BCE(out, mask) * self.W_BCE
-        # dice_loss = (1 - self.DICE(torch.sigmoid(out), mask)) * self.W_DICE
-        dice_loss = DICE(torch.sigmoid(out).squeeze(1), mask.squeeze(1)) * self.W_DICE
-        ssim_loss = -self.ssim(torch.sigmoid(out).float(), mask.float()) * self.W_SSIM
-        
         IoU = self.IoU(torch.sigmoid(out).float(), mask.long())
         
-        # total_loss = mse + bce + dice + ssim + KD
-        total_loss = mse_loss + bce_loss + dice_loss + ssim_loss + KD_loss
-
-        # log
-        self.log('val/total_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log('val/mse', mse_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log('val/bce', bce_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log('val/dice', dice_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log('val/ssim', -ssim_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log('val/KD', KD_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-
-        self.log('val/IoU', IoU, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-
-        # log image
-        if batch_idx == 0:
-            img_grid = make_img_grid(mask, out)
-            self.logger.experiment.add_images('val/images', img_grid, self.global_step, dataformats="CHW")
-    
-    def test_step(self, batch, batch_idx):
-        amp, pha, mask = batch
-
-        # forward
-        out, mu, logvar, amp_channel, pha_channel = self.forward(amp, pha, mask)
-
-        # loss
-        mse_loss = self.mse(torch.sigmoid(out), mask) * self.W_MSE
-        bce_loss = self.BCE(out, mask) * self.W_BCE
-        # dice_loss = (1 - self.DICE(torch.sigmoid(out), mask)) * self.W_DICE
-        dice_loss = DICE(torch.sigmoid(out).squeeze(1), mask.squeeze(1)) * self.W_DICE
-        ssim_loss = -self.ssim(torch.sigmoid(out).float(), mask.float()) * self.W_SSIM
-        
-        IoU = self.IoU(torch.sigmoid(out).float(), mask.long())
-        
-        # total_loss = mse + bce + dice + ssim
+        # total_loss = bce_loss + dice_loss + ssim_loss
         total_loss = mse_loss + bce_loss + dice_loss + ssim_loss
 
-        # log
-        self.log('test/total_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log('test/mse', mse_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log('test/bce', bce_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log('test/dice', dice_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log('test/ssim', -ssim_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        if dataloader_idx == 0:
+            prefix = 'seen'
+        elif dataloader_idx == 1:
+            prefix = 'unseen_1'
+        else:
+            prefix = 'unseen_2'
 
-        self.log('test/IoU', IoU, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log_dict({
+            f'val/{prefix}/total_loss': total_loss,
+            f'val/{prefix}/mse': mse_loss/self.W_MSE,
+            f'val/{prefix}/bce': bce_loss/self.W_BCE,
+            f'val/{prefix}/dice': dice_loss/self.W_DICE,
+            f'val/{prefix}/ssim': -ssim_loss/self.W_SSIM,
+            f'val/{prefix}/kl': KD_loss/self.W_KL,
+            f'val/{prefix}/IoU': IoU,
+        }, on_epoch=True, prog_bar=True, logger=True, sync_dist=True, add_dataloader_idx=False)
+
+        # for checkpoint
+        if dataloader_idx == 1:
+            self.log(f'val_loss', total_loss,
+            on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True, add_dataloader_idx=False)
 
         # log image
         if batch_idx == 0:
-            img_grid = make_img_grid(mask, out)
+            if self.teacher_arch == 'CLIPVAE':
+                img_grid = make_img_grid_for_clip(org_rgb, mask, vae_out, out)
+            elif self.teacher_arch == 'VAE':
+                img_grid = make_img_grid(mask, vae_out, out)
+            self.logger.experiment.add_images(f'val/{prefix}/images', img_grid, self.global_step, dataformats="CHW")
+    
+    def test_step(self, batch, batch_idx):
+        amp, pha, mask, clip_rgb, org_rgb = batch
+        if self.teacher_arch == 'CLIPVAE':
+            out, vae_out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z = self.forward(amp, pha, clip_rgb)
+        elif self.teacher_arch == 'VAE':
+            out, vae_out, mu, logvar, amp_channel, pha_channel, csi_z, vae_z = self.forward(amp, pha, mask)
+
+        mse_loss = self.mse(torch.sigmoid(out), mask) * self.W_MSE
+        bce_loss = self.BCE(out, mask) * self.W_BCE
+        # dice_loss = (1 - self.DICE(torch.sigmoid(out), mask)) * self.W_DICE
+        dice_loss = DICE(torch.sigmoid(out).squeeze(1), mask.squeeze(1)) * self.W_DICE
+        ssim_loss = (-self.ssim(torch.sigmoid(out).float(), mask.float())) * self.W_SSIM
+        IoU = self.IoU(torch.sigmoid(out).float(), mask.long())
+        
+        total_loss = bce_loss + dice_loss + ssim_loss
+
+        self.log_dict({
+            'val/total_loss': total_loss,
+            'val/mse': mse_loss/self.W_MSE,
+            'val/bce': bce_loss/self.W_BCE,
+            'val/dice': dice_loss/self.W_DICE,
+            'val/ssim': -ssim_loss/self.W_SSIM,
+            'val/IoU': IoU,
+        }, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+
+        # log image
+        if batch_idx == 0:
+            if self.teacher_arch == 'CLIPVAE':
+                img_grid = make_img_grid_for_clip(org_rgb, mask, vae_out, out)
+            elif self.teacher_arch == 'VAE':
+                img_grid = make_img_grid(mask, vae_out, out)
             self.logger.experiment.add_images('test/images', img_grid, self.global_step, dataformats="CHW")
 
 
     def configure_optimizers(self):
-        # Optimizer
-        if self.config['optimizer'] == 'SGD':
-            optimizer = torch.optim.SGD(self.parameters(), lr=self.config['lr'], momentum=0.9, weight_decay=1e-5)
-        elif self.config['optimizer'] == 'Adam':
-            optimizer = torch.optim.Adam(self.parameters(), lr=self.config['lr'], betas=(0.9, 0.999), eps=1e-8)
-        elif self.config['optimizer'] == 'AdamW':
-            optimizer = torch.optim.AdamW(self.parameters(), lr=self.config['lr'], betas=(0.9, 0.999), eps=1e-8)
-        else:
-            optimizer = torch.optim.SGD(self.parameters(), lr=self.config['lr'], momentum=0.9, weight_decay=1e-5)
-        # Scheduler
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=1500)
-        # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30, 60, 90, 120, 250], gamma=0.7)
-        scheduler_setup = {
+        opt_name = self.config['optimizer']
+        lr = self.config['lr']
+        params = self.parameters()
+
+        if opt_name == 'adam':
+            optimizer = torch.optim.Adam(params, lr=lr, betas=(0.9, 0.999), eps=1e-8)
+        elif opt_name == 'adamw':
+            optimizer = torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.999), eps=1e-8)
+        else:  # Default to SGD
+            optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=1e-5)
+
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=1500)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[4, 7, 10, 13, 16], gamma=0.7)
+        return [optimizer], [{
             "scheduler": scheduler,
-            "interval": "step",
+            "interval": "epoch",
             "monitor": "train/total_loss",
-        }
-        return [optimizer], [scheduler_setup]
+        }]
 
 
 def main(config):
     """
-    Main function for training
+    Main function for training CSI2Mask model with PyTorch Lightning.
     :param config: dict, configuration for training and file paths
     """
 
-    # Load config
-    model_config_path = config['model_config_path']
-    with open(model_config_path, 'r') as f:
+    # Load model-specific configuration from YAML
+    with open(config['model_config_path'], 'r') as f:
         modelconfig = yaml.load(f, Loader=yaml.CLoader)
 
-    # Create lighning model
+    # Initialize LightningModule
     model = CSIEncoderLightning(config=config, modelconfig=modelconfig)
 
-    # Create Dataloader
-    dataset = CSI2Mask_Dataset(json_path=config['train&val_json_path'], data_root=config['data_root'], mode='train')
-    train_dataloader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'], shuffle=True)
+    # Setup dataset and dataloaders
+    # =============================train=============================
+    train_dataset = CSI2Mask_Dataset(
+        json_path=config['train&val_json_path'],
+        data_root=config['data_root'],
+        mode='train',
+        clip_pretrain_model=config['clip_pretrain_model']
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        num_workers=config['num_workers'],
+        pin_memory=False,
+        drop_last=True
+    )
+    # =============================val=============================
+    val_dataset = CSI2Mask_Dataset(
+        json_path=config['train&val_json_path'],
+        data_root=config['data_root'],
+        mode='val',
+        clip_pretrain_model=config['clip_pretrain_model']
+    )
+    val_loader_00 = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=config['num_workers'],
+        pin_memory=False
+    )
+    val_dataset = CSI2Mask_Dataset(
+        json_path=config['val_json_path'],
+        data_root=config['data_root'],
+        mode='val',
+        clip_pretrain_model=config['clip_pretrain_model']
+    )
+    val_loader_01 = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=config['num_workers'],
+        pin_memory=False
+    )
+    val_dataset = CSI2Mask_Dataset(
+        json_path=config['test_json_path'],
+        data_root=config['data_root'],
+        mode='test',
+        clip_pretrain_model=config['clip_pretrain_model']
+    )
+    val_loader_02 = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=config['num_workers'],
+        pin_memory=False
+    )
+    val_loaders = [val_loader_00, val_loader_01, val_loader_02]
+    # =============================test=============================
+    test_dataset = CSI2Mask_Dataset(
+        json_path=config['test_json_path'],
+        data_root=config['data_root'],
+        mode='test',
+        clip_pretrain_model=config['clip_pretrain_model']
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=config['num_workers'],
+        pin_memory=False
+    )
 
-    dataset = CSI2Mask_Dataset(json_path=config['train&val_json_path'], data_root=config['data_root'], mode='val')
-    val_dataloader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'], shuffle=False)
-
-    dataset = CSI2Mask_Dataset(json_path=config['test_json_path'], data_root=config['data_root'], mode='test')
-    test_dataloader = DataLoader(dataset, batch_size=config['batch_size'], num_workers=config['num_workers'], shuffle=False)
-
-    # Create Tensorboard logger
+    # Setup Tensorboard logger
     logger = TensorBoardLogger("lightning_logs", name="WiFi2Seg")
     
+    # Setup callbacks
+    callbacks = [
+        EarlyStopping(
+            monitor='val/total_loss',
+            patience=20,
+            mode='min'
+        )
+    ]
 
-    # Create Trainer
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=config['dirpath'],
+        save_top_k=5,
+        monitor='val_loss',
+        mode="min",
+        filename='WiFi2Seg-{epoch:02d}-{step}-{val_loss:.2f}'
+    )
+
+    # Initialize PyTorch Lightning Trainer
     if config['mode'] == 'train':
-        trainer = Trainer(max_epochs=config['epochs'], logger=logger, precision="16-mixed")
-        trainer.fit(model, train_dataloader, val_dataloader)
+        trainer = Trainer(
+            max_epochs=config['epochs'],
+            logger=logger,
+            strategy="ddp_find_unused_parameters_true",
+            devices=[0, 1],
+            callbacks=[checkpoint_callback],
+            precision='16-mixed',
+            log_every_n_steps=100,
+            num_sanity_val_steps=2,
+        )
+        trainer.fit(model, train_loader, val_loaders, ckpt_path=config['ckpt_path'])
     elif config['mode'] == 'test':
-        trainer = Trainer(logger=logger)
-        trainer.test(model, test_dataloader, ckpt_path=config['ckpt_path'])
+        trainer = Trainer(logger=logger, devices=[0], num_nodes=1)
+        trainer.test(model, val_loader_00, ckpt_path=config['ckpt_path'])
 
 if __name__ == '__main__':
     config = {
         'lr': 1e-3,
-        'batch_size': 112,
-        'num_workers': 8,
+        'batch_size': 48,
+        'num_workers': 24,
         'epochs': 30,
         'optimizer': 'SGD',
+        'mode': 'train',
+        'compile': False,
         'model_config_path': './model_config.yaml',
-        'data_root': '/root/SSD/PiWiFi/NYCU/', # /root/SSD/PiWiFi/NYCU/
+        'data_root': '/root/CSI/CSI_dataset_NYCU/', # /root/SSD/PiWiFi/NYCU/
         'train&val_json_path': '/root/terry/CoWIP/datas/NYCU/train&val.json',
         'val_json_path': '/root/terry/CoWIP/datas/NYCU/val.json',
         'test_json_path': '/root/terry/CoWIP/datas/NYCU/test.json',
-        'mode': 'train',
-        'ckpt_path': '/root/terry/CoWIP/lightning_logs/VAE/version_68/checkpoints/epoch=23-step=17184.ckpt',
+        # resume setting
+        'dirpath': None,
+        'ckpt_path': None,
+        # decoder setting
+        'load_decoder': True,
+        'decoder_path': '/root/terry/CoWIP/lightning_logs/VAE/VAE_1x1_new/checkpoints/VAE-epoch=174-step=125125-val_loss=3.61.ckpt',
+        # teacher setting
+        'teacher_arch': 'VAE',
+        'teacher_path': '/root/terry/CoWIP/lightning_logs/VAE/VAE_1x1_new/checkpoints/VAE-epoch=174-step=125125-val_loss=3.61.ckpt',
+        # pre-trained model setting
+        'clip_pretrain_model': 'RN50',
+        # model list: ['RN50','RN101','RN50x4','RN50x16','RN50x64',
+        #              'ViT-B/32','ViT-B/16','ViT-L/14','ViT-L/14@336px']
     }
 
     main(config=config)
