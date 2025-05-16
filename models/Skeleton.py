@@ -180,10 +180,10 @@ class VAE_Finetune(nn.Module):
         return z
 
 class CLIPVAE(nn.Module):
-    def __init__(self, activation='leakyrelu', teacher_arch='RN50') -> None:
+    def __init__(self, activation='leakyrelu', clip_pretrain_model='RN50') -> None:
         super(CLIPVAE, self).__init__()
-        self.CLIP_model, _ = clip.load(teacher_arch)
-        print(f"[MODEL] CLIP model: {teacher_arch}")
+        self.CLIP_model, _ = clip.load(clip_pretrain_model)
+        print(f"[MODEL] CLIP model: {clip_pretrain_model}")
         self.decoder = Decoder(activation=activation)
         self.feature_size = [1, 1]
         self.latent_dim = 1024*self.feature_size[0]*self.feature_size[1]

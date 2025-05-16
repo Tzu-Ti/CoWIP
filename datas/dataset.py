@@ -79,7 +79,7 @@ class Mask_Dataset(Dataset):
 class Mask_CLIP_Dataset(Dataset):
     def __init__(self,
                  json_path: str, data_root: str, mode: str = 'train',
-                 size: tuple = (192, 256), clip_pretrain_model: str = 'RN50'):
+                 size: tuple = (192, 256), teacher_arch: str = 'RN50'):
         """
         Mask dataset
         :param json_path: the file contain data path
@@ -88,13 +88,13 @@ class Mask_CLIP_Dataset(Dataset):
         :param teacher_model: the teacher model of CLIP
         """
         self.mode = mode
-        self.clip_pretrain_model = clip_pretrain_model
+        self.teacher_arch = teacher_arch
 
         # Get the data list
         self.data_list = get_data_list(json_path, mode)
         self.data_list = [os.path.join(data_root, data) for data in self.data_list]
 
-        _, self.preprocess = clip.load(self.clip_pretrain_model)
+        _, self.preprocess = clip.load(self.teacher_arch)
 
         self.resize = transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC, max_size=None, antialias=True)
 
@@ -143,7 +143,7 @@ class CSI2Mask_Dataset(Dataset):
                  json_path: str, data_root: str, mode: str = 'train',
                  size: tuple = (192, 256),
                  amp_offset: float = 60000, pha_offset: float = 28000,
-                 clip_pretrain_model: str = 'RN50'):
+                 teacher_arch: str = 'RN50'):
         """
         CSI2Mask dataset
         :param json_path: the file contain data path
@@ -154,7 +154,7 @@ class CSI2Mask_Dataset(Dataset):
         :param teacher_model: the teacher model of CLIP
         """
         self.mode = mode
-        self.clip_pretrain_model = clip_pretrain_model
+        self.teacher_arch = teacher_arch
         self.amp_offset = amp_offset
         self.pha_offset = pha_offset
 
@@ -162,7 +162,8 @@ class CSI2Mask_Dataset(Dataset):
         self.data_list = get_data_list(json_path, mode)
         self.data_list = [os.path.join(data_root, data) for data in self.data_list]
 
-        _, self.preprocess = clip.load(self.clip_pretrain_model)
+        if self.teacher_arch != 'VAE':
+            _, self.preprocess = clip.load(self.teacher_arch)
 
         self.resize = transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC, max_size=None, antialias=True)
 
@@ -239,14 +240,15 @@ class CSI2Mask_Dataset(Dataset):
         """
         mask = Image.open(mask_path).convert('L')
         mask = self.transform(mask).float()
-
-        image = Image.open(rgb_path).convert('RGB')
+        if self.teacher_arch != 'VAE':
+            image = Image.open(rgb_path).convert('RGB')
         
-        clip_rgb = self.resize(image)
-        clip_rgb = self.preprocess(clip_rgb).float()
-        org_rgb = self.transform(image).float()
-
-        return mask, clip_rgb, org_rgb
+            clip_rgb = self.resize(image)
+            clip_rgb = self.preprocess(clip_rgb).float()
+            org_rgb = self.transform(image).float()
+            return mask, clip_rgb, org_rgb
+        else:
+            return mask, torch.tensor(0), torch.tensor(0)
 
     def __getitem__(self, index):
         csi_path = self.data_list[index]

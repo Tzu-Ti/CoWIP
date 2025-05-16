@@ -65,15 +65,11 @@ class CSIEncoderLightning(LightningModule):
             self.teacher_arch = 'CLIPVAE'
             self.vae = CLIPVAE(activation='leakyrelu', teacher_arch=config['teacher_arch'])
         
-        # Load decoder and teacher model & freeze parameters
-        if config['load_decoder']:    
-            checkpoint = torch.load(config['decoder_path'])
-            decoder_state_dict = {k.replace('net.','').replace('_orig_mod.','').replace('decoder.',''): v for k, v in checkpoint["state_dict"].items() if 'decoder' in k}
-            self.decoder.load_state_dict(decoder_state_dict)
-            for param in self.decoder.parameters():
-                param.requires_grad = False
+        # Load fine tune model and teacher model & freeze parameters
+        if config['fine_tune_model']:
+            checkpoint = torch.load(config['fine_tune_model'])
+            self.load_state_dict(checkpoint["state_dict"], strict=False)
             checkpoint = None
-            decoder_state_dict = None
         if config['teacher_arch']:
             checkpoint = torch.load(config['teacher_path'])
             vae_state_dict = {k.replace('net.','').replace('_orig_mod.',''): v for k, v in checkpoint["state_dict"].items()}
@@ -94,13 +90,13 @@ class CSIEncoderLightning(LightningModule):
 
         # Loss weights
         self.W_KD = 1
-        self.W_MSE = 1 # 40/2
-        self.W_BCE = 1 # 10/2
-        self.W_DICE = 1 # 3/2
-        self.W_KL = 1 # 100/2
-        self.W_CL = 1 # 0.5
+        self.W_MSE = 40 # 40
+        self.W_BCE = 5 # 10
+        self.W_DICE = 5 # 3
+        self.W_KL = 10 # 100
+        self.W_CL = 0.5 # 0.5
 
-        self.W_SSIM = 1 # 1/2
+        self.W_SSIM = 0.5 # 1
 
     def forward(self, amp, pha, mask):
         # create random mask for self-attention
@@ -146,7 +142,7 @@ class CSIEncoderLightning(LightningModule):
 
         IoU = self.IoU(torch.sigmoid(out).float(), mask.long())
 
-        total_loss = bce_loss + dice_loss + kl_loss + cl_loss + KD_loss
+        total_loss = mse_loss + bce_loss + dice_loss + kl_loss + cl_loss + ssim_loss
 
         self.log_dict({
             'train/total_loss': total_loss,
@@ -267,8 +263,7 @@ class CSIEncoderLightning(LightningModule):
             optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=1e-5)
 
         # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=1500)
-        # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[4, 7, 10, 13, 16], gamma=0.7)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[7, 14, 21, 28, 35, 42, 49], gamma=0.7)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[2, 4, 6, 8], gamma=0.5)
         return [optimizer], [{
             "scheduler": scheduler,
             "interval": "epoch",
@@ -362,7 +357,7 @@ def main(config):
     )
 
     # Setup Tensorboard logger
-    logger = TensorBoardLogger("lightning_logs", name="WiFi2Seg")
+    logger = TensorBoardLogger("lightning_logs", name="FineTuning")
     
     # Setup callbacks
     callbacks = [
@@ -387,13 +382,13 @@ def main(config):
             max_epochs=config['epochs'],
             logger=logger,
             strategy="ddp_find_unused_parameters_true",
-            devices=[0, 1],
+            devices=[0, 1, 2],
             callbacks=[checkpoint_callback],
             precision='16-mixed',
             log_every_n_steps=100,
             num_sanity_val_steps=2,
         )
-        trainer.fit(model, train_loader, val_loaders, ckpt_path=config['ckpt_path'])
+        trainer.fit(model, train_loader, val_loaders)
     elif config['mode'] == 'test':
         trainer = Trainer(logger=logger, devices=[0], num_nodes=1)
         trainer.test(model, val_loader_02, ckpt_path=config['ckpt_path'])
@@ -402,10 +397,10 @@ if __name__ == '__main__':
     config = {
         'lr': 1e-5,
         'batch_size': 96,
-        'num_workers': 32,
-        'epochs': 50,
+        'num_workers': 16,
+        'epochs': 10,
         'optimizer': 'adamw',
-        'mode': 'test',
+        'mode': 'train',
         'compile': False,
         'model_config_path': './model_config.yaml',
         'data_root': '/root/CSI/CSI_dataset_NYCU/', # /root/SSD/PiWiFi/NYCU/
@@ -414,10 +409,7 @@ if __name__ == '__main__':
         'test_json_path': '/root/terry/CoWIP/datas/NYCU/test.json',
         # resume setting
         'dirpath': None,
-        'ckpt_path': '/root/terry/CoWIP/lightning_logs/FineTuning/RN50_1x1_NYCU_orgparameter_woKD/checkpoints/WiFi2Seg-epoch=00-step=1272-val_loss=2.78.ckpt',
-        # decoder setting
-        'load_decoder': True,
-        'decoder_path': '/root/terry/CoWIP/lightning_logs/CLIPVAE/RN50_1x1_NYCU/checkpoints/CLIPVAE-epoch=71-step=137448-total_loss=5.00.ckpt',
+        'fine_tune_model': '/root/terry/CoWIP/lightning_logs/WiFi2Seg/RN50_1x1_NYCU_orgparameter_baseline/checkpoints/WiFi2Seg-epoch=05-step=22908-val_loss=1.22.ckpt',
         # teacher setting
         'teacher_arch': 'RN50',
         # model list: ['RN50','RN101','RN50x4','RN50x16','RN50x64',
